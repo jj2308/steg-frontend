@@ -1,13 +1,16 @@
-import { useState } from "react";
+import { useState, useEffect, useCallback, useRef } from "react";
 import Head from "next/head";
 import Link from "next/link";
-import { Image, Video, Upload, FileUp, Key, Lock, Eye, EyeOff } from "lucide-react";
-import { embedData } from "../lib/api";
+import { Image, Video, Upload, FileUp, Key, Lock, Eye, EyeOff, ShieldCheck, HardDrive, AlertTriangle } from "lucide-react";
+import { embedData, checkCapacity, generateJobId, checkEmbedProgress } from "../lib/api";
 import EmbedResult from "../components/EmbedResult";
 
 export default function EmbedPage() {
   const [mediaType, setMediaType] = useState("image");
   const [coverFile, setCoverFile] = useState(null);
+  const [capacity, setCapacity] = useState(null);      // { max_bytes, ... }
+  const [capLoading, setCapLoading] = useState(false);
+  const [capError, setCapError] = useState("");
   const [secretMode, setSecretMode] = useState("text");
   const [secretText, setSecretText] = useState("");
   const [secretFile, setSecretFile] = useState(null);
@@ -15,8 +18,111 @@ export default function EmbedPage() {
   const [showPass, setShowPass] = useState(false);
   const [loading, setLoading] = useState(false);
   const [progress, setProgress] = useState(0);
+  const [stage, setStage] = useState("");        // current processing stage
+  const [frameProgress, setFrameProgress] = useState(null); // {frames_processed, total_frames, elapsed}
   const [error, setError] = useState("");
+  const pollRef = useRef(null);
+
+  const fmtTime = (secs) => {
+    if (!secs || secs < 0) return "--:--";
+    const m = Math.floor(secs / 60);
+    const s = Math.floor(secs % 60);
+    return `${String(m).padStart(2, "0")}:${String(s).padStart(2, "0")}`;
+  };
+
+  const STAGE_LABELS = {
+    uploading:  "Uploading file...",
+    analyzing:  "Analyzing video...",
+    embedding:  "Embedding data into frames...",
+    encoding:   "Encoding output video...",
+    finalizing: "Finalizing...",
+    done:       "Complete",
+    processing: "Processing...",
+    queued:     "Waiting to process...",
+  };
+
+  // --- Capacity fetch on cover file change ---
+  const handleCoverFile = useCallback(async (file) => {
+    setCoverFile(file);
+    setCapacity(null);
+    setCapError("");
+    setError("");
+    if (!file) return;
+    setCapLoading(true);
+    try {
+      const data = await checkCapacity(file, mediaType);
+      setCapacity(data);
+    } catch (err) {
+      setCapError(err.message);
+    } finally {
+      setCapLoading(false);
+    }
+  }, [mediaType]);
+
+  // Re-fetch capacity if media type changes while a file is selected
+  useEffect(() => {
+    if (coverFile) handleCoverFile(coverFile);
+  }, [mediaType]); // eslint-disable-line react-hooks/exhaustive-deps
+
+  // --- Secret data size (estimated) ---
+  const secretSize = secretMode === "file"
+    ? (secretFile ? secretFile.size : 0)
+    : new Blob([secretText]).size;
+
+  // Encryption adds ~1.45x overhead (zlib + AES padding + base64)
+  const estimatedEncryptedSize = secretSize > 0 ? Math.ceil(secretSize * 1.45) + 64 : 0;
+  const maxBytes = capacity?.max_bytes ?? null;
+  const overCapacity = maxBytes !== null && estimatedEncryptedSize > 0 && estimatedEncryptedSize > maxBytes;
+
+  // --- Dynamic frame calculation (video only) ---
+  const bitsPerFrame = capacity?.bits_per_frame ?? 0;
+  const totalFrames = capacity?.total_frames ?? 0;
+  const framesNeeded = (bitsPerFrame > 0 && estimatedEncryptedSize > 0)
+    ? Math.min(Math.max(1, Math.ceil((estimatedEncryptedSize * 8) / bitsPerFrame)), totalFrames)
+    : 0;
+
+  const fmtSize = (bytes) => {
+    if (bytes >= 1024 * 1024) return (bytes / (1024 * 1024)).toFixed(2) + " MB";
+    if (bytes >= 1024) return (bytes / 1024).toFixed(1) + " KB";
+    return bytes + " B";
+  };
+
+  const handlePassphraseChange = (value) => {
+    setPassphrase(value);
+    // Always clear error when the user edits the passphrase field — avoids
+    // stale "Password too weak" messages lingering after the password becomes valid.
+    setError("");
+  };
   const [result, setResult] = useState(null);
+
+  // --- Password strength logic ---
+  const getPassChecks = (pw) => ({
+    length: pw.length >= 8,
+    upper: /[A-Z]/.test(pw),
+    lower: /[a-z]/.test(pw),
+    number: /[0-9]/.test(pw),
+    special: /[!@#$%^&*()_+\-=\[\]{};':"\\|,.<>/?`~]/.test(pw),
+  });
+
+  const passChecks = getPassChecks(passphrase);
+  const passScore = Object.values(passChecks).filter(Boolean).length; // 0-5
+  const passValid = passScore === 5;
+
+  const strengthLabel =
+    passphrase.length === 0 ? null
+    : passScore <= 2 ? "Weak"
+    : passScore <= 4 ? "Medium"
+    : "Strong";
+
+  const strengthColor =
+    passScore <= 2 ? "bg-red-500"
+    : passScore <= 4 ? "bg-amber-500"
+    : "bg-green-500";
+
+  const strengthTextColor =
+    passScore <= 2 ? "text-red-600"
+    : passScore <= 4 ? "text-amber-600"
+    : "text-green-600";
 
   const handleSubmit = async (e) => {
     e.preventDefault();
@@ -25,9 +131,16 @@ export default function EmbedPage() {
     setProgress(0);
 
     if (!coverFile) { setError("Please upload a cover file."); return; }
-    if (!passphrase || passphrase.length < 4) { setError("Passphrase must be at least 4 characters."); return; }
+    if (!passValid) {
+      setError("Password too weak. Please use at least 8 characters including uppercase, lowercase, number, and special character.");
+      return;
+    }
     if (secretMode === "text" && !secretText.trim()) { setError("Please enter secret text."); return; }
     if (secretMode === "file" && !secretFile) { setError("Please upload a secret file."); return; }
+    if (overCapacity) {
+      setError("The selected carrier file is too small to hold this data. Please upload a larger file.");
+      return;
+    }
 
     const formData = new FormData();
     formData.append("media_type", mediaType);
@@ -40,13 +153,45 @@ export default function EmbedPage() {
     }
 
     setLoading(true);
+    setStage("uploading");
+
+    // For video embeds, generate a job ID and poll progress
+    const jobId = mediaType === "video" ? generateJobId() : "";
+    if (jobId) formData.append("job_id", jobId);
+
+    // Start polling backend for stage + frame progress (video only)
+    if (jobId) {
+      pollRef.current = setInterval(async () => {
+        try {
+          const info = await checkEmbedProgress(jobId);
+          if (info.stage && info.stage !== "queued") {
+            setStage(info.stage);
+          }
+          if (info.frames_processed != null) {
+            setFrameProgress({
+              frames_processed: info.frames_processed,
+              total_frames: info.total_frames,
+              elapsed: info.elapsed,
+            });
+          }
+        } catch {}
+      }, 1000);
+    }
+
     try {
-      const data = await embedData(formData, setProgress);
+      const data = await embedData(formData, (pct) => {
+        setProgress(pct);
+        if (pct >= 100 && !jobId) setStage("processing");
+        if (pct >= 100 && jobId && stage === "uploading") setStage("analyzing");
+      });
       setResult(data);
     } catch (err) {
       setError(err.message);
     } finally {
+      if (pollRef.current) { clearInterval(pollRef.current); pollRef.current = null; }
       setLoading(false);
+      setStage("");
+      setFrameProgress(null);
     }
   };
 
@@ -136,9 +281,95 @@ export default function EmbedPage() {
                     ? "image/png,image/jpeg"
                     : "video/mp4,video/quicktime,video/x-msvideo"
                 }
-                onChange={(e) => setCoverFile(e.target.files[0] || null)}
+                onChange={(e) => handleCoverFile(e.target.files[0] || null)}
               />
             </label>
+
+            {/* Capacity indicator */}
+            {capLoading && (
+              <div className="mt-3 flex items-center gap-2 text-xs text-slate-500">
+                <span className="w-3.5 h-3.5 border-2 border-slate-400 border-t-transparent rounded-full animate-spin" />
+                Estimating capacity...
+              </div>
+            )}
+            {capError && (
+              <div className="mt-3 bg-amber-50 border border-amber-200 rounded-lg p-2.5 text-xs text-amber-700">
+                {capError} You can still attempt embedding.
+              </div>
+            )}
+            {capacity && !capLoading && (
+              <div className="mt-3 bg-slate-50 border border-slate-200 rounded-lg p-3">
+                <div className="flex items-center gap-2 text-sm font-semibold text-slate-700 mb-2">
+                  <HardDrive className="w-4 h-4 text-blue-500" /> Carrier Capacity
+                </div>
+                <div className="grid grid-cols-3 gap-3 text-center text-xs">
+                  <div>
+                    <div className="font-bold text-slate-800 text-sm">{fmtSize(maxBytes)}</div>
+                    <div className="text-slate-500">Max capacity</div>
+                  </div>
+                  {estimatedEncryptedSize > 0 && (
+                    <div>
+                      <div className={`font-bold text-sm ${overCapacity ? "text-red-600" : "text-slate-800"}`}>
+                        {fmtSize(estimatedEncryptedSize)}
+                      </div>
+                      <div className="text-slate-500">Est. encrypted size</div>
+                    </div>
+                  )}
+                  {estimatedEncryptedSize > 0 && maxBytes !== null && (
+                    <div>
+                      <div className={`font-bold text-sm ${overCapacity ? "text-red-600" : "text-green-600"}`}>
+                        {overCapacity ? "- " + fmtSize(estimatedEncryptedSize - maxBytes) : fmtSize(maxBytes - estimatedEncryptedSize)}
+                      </div>
+                      <div className="text-slate-500">{overCapacity ? "Over limit" : "Remaining"}</div>
+                    </div>
+                  )}
+                </div>
+                {/* Capacity bar */}
+                {estimatedEncryptedSize > 0 && maxBytes > 0 && (
+                  <div className="mt-2">
+                    <div className="h-1.5 bg-slate-200 rounded-full overflow-hidden">
+                      <div
+                        className={`h-full rounded-full transition-all duration-300 ${
+                          overCapacity ? "bg-red-500" : "bg-green-500"
+                        }`}
+                        style={{ width: `${Math.min((estimatedEncryptedSize / maxBytes) * 100, 100)}%` }}
+                      />
+                    </div>
+                  </div>
+                )}
+                {overCapacity && (
+                  <div className="mt-2 flex items-center gap-1.5 text-xs text-red-600 font-medium">
+                    <AlertTriangle className="w-3.5 h-3.5" />
+                    The selected carrier file is too small to hold this data. Please upload a larger file.
+                  </div>
+                )}
+                {/* Video-specific metadata */}
+                {capacity.total_frames != null && (
+                  <div className="mt-2 pt-2 border-t border-slate-200">
+                    <div className="grid grid-cols-2 gap-3 text-center text-xs text-slate-500">
+                      <div>{capacity.frame_width}&times;{capacity.frame_height} px</div>
+                      <div>{capacity.total_frames} frames{capacity.fps ? ` @ ${capacity.fps} fps` : ""}</div>
+                    </div>
+                    {framesNeeded > 0 && (
+                      <div className="mt-2 grid grid-cols-3 gap-3 text-center text-xs">
+                        <div>
+                          <div className="font-bold text-slate-700">{totalFrames}</div>
+                          <div className="text-slate-500">Available</div>
+                        </div>
+                        <div>
+                          <div className="font-bold text-blue-600">{framesNeeded}</div>
+                          <div className="text-slate-500">Required</div>
+                        </div>
+                        <div>
+                          <div className="font-bold text-green-600">{framesNeeded}</div>
+                          <div className="text-slate-500">Will be used</div>
+                        </div>
+                      </div>
+                    )}
+                  </div>
+                )}
+              </div>
+            )}
           </div>
 
           {/* Step 3: Secret data */}
@@ -210,8 +441,8 @@ export default function EmbedPage() {
                 className="flex-1 border border-slate-300 py-2 px-3 text-sm focus:outline-none focus:ring-2 focus:ring-accent/30 focus:border-accent"
                 placeholder="Enter a strong passphrase"
                 value={passphrase}
-                onChange={(e) => setPassphrase(e.target.value)}
-                minLength={4}
+                onChange={(e) => handlePassphraseChange(e.target.value)}
+                minLength={8}
                 required
               />
               <button
@@ -222,6 +453,42 @@ export default function EmbedPage() {
                 {showPass ? <EyeOff className="w-4 h-4 text-slate-500" /> : <Eye className="w-4 h-4 text-slate-500" />}
               </button>
             </div>
+
+            {/* Live strength indicator */}
+            {passphrase.length > 0 && (
+              <div className="mt-3">
+                <div className="flex items-center justify-between mb-1.5">
+                  <span className="text-xs text-slate-500 font-medium flex items-center gap-1">
+                    <ShieldCheck className="w-3.5 h-3.5" /> Password Strength
+                  </span>
+                  <span className={`text-xs font-bold ${strengthTextColor}`}>{strengthLabel}</span>
+                </div>
+                <div className="h-1.5 bg-slate-200 rounded-full overflow-hidden">
+                  <div
+                    className={`h-full rounded-full transition-all duration-300 ${strengthColor}`}
+                    style={{ width: `${(passScore / 5) * 100}%` }}
+                  />
+                </div>
+                <ul className="mt-2 grid grid-cols-2 gap-x-4 gap-y-1 text-xs">
+                  <li className={passChecks.length ? "text-green-600" : "text-slate-400"}>
+                    {passChecks.length ? "\u2713" : "\u2717"} At least 8 characters
+                  </li>
+                  <li className={passChecks.upper ? "text-green-600" : "text-slate-400"}>
+                    {passChecks.upper ? "\u2713" : "\u2717"} Uppercase letter
+                  </li>
+                  <li className={passChecks.lower ? "text-green-600" : "text-slate-400"}>
+                    {passChecks.lower ? "\u2713" : "\u2717"} Lowercase letter
+                  </li>
+                  <li className={passChecks.number ? "text-green-600" : "text-slate-400"}>
+                    {passChecks.number ? "\u2713" : "\u2717"} Number
+                  </li>
+                  <li className={passChecks.special ? "text-green-600" : "text-slate-400"}>
+                    {passChecks.special ? "\u2713" : "\u2717"} Special character (!@#$...)
+                  </li>
+                </ul>
+              </div>
+            )}
+
             <p className="text-xs text-slate-400 mt-2">
               AES-256-CBC encryption with zlib compression. Remember this passphrase for extraction.
             </p>
@@ -234,16 +501,64 @@ export default function EmbedPage() {
             </div>
           )}
 
-          {/* Progress bar */}
-          {loading && progress > 0 && (
+          {/* Progress / stage indicator */}
+          {loading && (
             <div className="mb-5">
-              <div className="bg-slate-200 rounded-full h-2 overflow-hidden">
-                <div
-                  className="bg-accent h-2 rounded-full transition-all duration-300"
-                  style={{ width: `${progress}%` }}
-                />
-              </div>
-              <p className="text-xs text-slate-400 mt-1 text-center">Uploading... {progress}%</p>
+              {progress > 0 && progress < 100 && (
+                <div className="mb-2">
+                  <div className="bg-slate-200 rounded-full h-2 overflow-hidden">
+                    <div
+                      className="bg-accent h-2 rounded-full transition-all duration-300"
+                      style={{ width: `${progress}%` }}
+                    />
+                  </div>
+                  <p className="text-xs text-slate-400 mt-1 text-center">Uploading... {progress}%</p>
+                </div>
+              )}
+              {(progress >= 100 || stage !== "uploading") && stage && (
+                <div className="bg-slate-50 border border-slate-200 rounded-xl p-4">
+                  {/* Frame-level progress bar */}
+                  {frameProgress && frameProgress.total_frames > 0 ? (() => {
+                    const fp = frameProgress;
+                    const pct = Math.min((fp.frames_processed / fp.total_frames) * 100, 100);
+                    const encFps = fp.elapsed > 0 ? (fp.frames_processed / fp.elapsed) : 0;
+                    const remaining = fp.total_frames - fp.frames_processed;
+                    const eta = encFps > 0 ? remaining / encFps : 0;
+                    return (
+                      <>
+                        <div className="flex items-center justify-between mb-2">
+                          <span className="text-sm font-semibold text-slate-700 flex items-center gap-2">
+                            <span className="w-4 h-4 border-2 border-accent border-t-transparent rounded-full animate-spin" />
+                            {STAGE_LABELS[stage] || "Processing..."}
+                          </span>
+                          <span className="text-sm font-bold text-accent">{pct.toFixed(1)}%</span>
+                        </div>
+                        <div className="bg-slate-200 rounded-full h-2.5 overflow-hidden mb-3">
+                          <div
+                            className="bg-accent h-2.5 rounded-full transition-all duration-500"
+                            style={{ width: `${pct}%` }}
+                          />
+                        </div>
+                        <div className="grid grid-cols-2 gap-x-4 gap-y-1.5 text-xs">
+                          <div className="text-slate-500">Progress</div>
+                          <div className="text-right font-medium text-slate-700">{fp.frames_processed.toLocaleString()} / {fp.total_frames.toLocaleString()} frames</div>
+                          <div className="text-slate-500">Encoding speed</div>
+                          <div className="text-right font-medium text-slate-700">{encFps > 0 ? encFps.toFixed(1) : "--"} fps</div>
+                          <div className="text-slate-500">Elapsed time</div>
+                          <div className="text-right font-medium text-slate-700">{fmtTime(fp.elapsed)}</div>
+                          <div className="text-slate-500">Estimated remaining</div>
+                          <div className="text-right font-medium text-blue-600">~{fmtTime(eta)}</div>
+                        </div>
+                      </>
+                    );
+                  })() : (
+                    <div className="flex items-center justify-center gap-2 text-sm text-slate-600 font-medium">
+                      <span className="w-4 h-4 border-2 border-accent border-t-transparent rounded-full animate-spin" />
+                      {STAGE_LABELS[stage] || "Processing..."}
+                    </div>
+                  )}
+                </div>
+              )}
             </div>
           )}
 
@@ -251,13 +566,13 @@ export default function EmbedPage() {
           <div className="text-center">
             <button
               type="submit"
-              disabled={loading}
+              disabled={loading || overCapacity}
               className="btn-accent text-lg px-8 py-3 disabled:opacity-50 disabled:cursor-not-allowed"
             >
               {loading ? (
                 <span className="flex items-center gap-2">
                   <span className="w-4 h-4 border-2 border-white border-t-transparent rounded-full animate-spin" />
-                  Processing...
+                  {stage === "uploading" ? "Uploading..." : STAGE_LABELS[stage] || "Processing..."}
                 </span>
               ) : (
                 <span className="flex items-center gap-2">
